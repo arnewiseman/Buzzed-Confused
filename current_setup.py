@@ -14,11 +14,12 @@ import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.cpx import CPXFunction
 from cflib.utils import uri_helper
+from cflib.positioning.motion_commander import MotionCommander
+
 
 # Camera settings
 CAM_WIDTH = 324
 CAM_HEIGHT = 244
-
 
 
 class ImageDownloader(threading.Thread):
@@ -30,7 +31,7 @@ class ImageDownloader(threading.Thread):
 
     def run(self):
         while True:
-            p = self._cpx.receivePacket(CPXFunction.APP)  # CPX_F_APP == 5
+            p = self._cpx.receivePacket(CPXFunction.APP)
             [magic, width, height, depth, format, size] = struct.unpack('<BHHBBI', p.data[0:11])
             if magic == 0xBC:
                 imgStream = bytearray()
@@ -59,6 +60,12 @@ class ImageProcessor(QtCore.QThread):
         self._frame_queue = []
         self._lock = threading.Lock()
         self._running = True
+
+        self.distance = None
+        self.angle = None
+        self.x_pos = None
+        self.y_pos = None
+        self.found_tag = False
     
     def stop(self):
         self._running = False
@@ -94,6 +101,7 @@ class ImageProcessor(QtCore.QThread):
                     tags = self.detector.detect(gray)
                     
                     for tag in tags:
+                        # Draw tag as before...
                         for i in range(4):
                             pt1 = tuple(map(int, tag.corners[i - 1]))
                             pt2 = tuple(map(int, tag.corners[i]))
@@ -103,6 +111,33 @@ class ImageProcessor(QtCore.QThread):
                         cv2.putText(rgb, f"ID {tag.tag_id}", center,
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
+                        # === 2D DISTANCE ESTIMATION ===
+                        TAG_SIZE = 0.128
+                        fx = 200.0  
+
+                        # Estimate pixel width from corner 0 to 1
+                        pixel_width = np.linalg.norm(tag.corners[0] - tag.corners[1])
+
+                        if pixel_width > 0:
+                            self.distance = (TAG_SIZE * fx) / pixel_width
+                        else:
+                            self.distance = -1  # Invalid
+
+                        # Compute angle from image center
+                        cx = CAM_WIDTH / 2
+                        cy = CAM_HEIGHT / 2
+
+                        dx = tag.center[0] - cx
+                        angle_rad = np.arctan2(dx, fx)
+
+                        # Get relative X,Y position (same plane)
+                        self.x_pos = self.distance * np.sin(angle_rad)
+                        self.y_pos = self.distance * np.cos(angle_rad)
+                        self.angle = np.degrees(angle_rad)
+
+                        print(f"Distance: {self.distance:.2f}m, Angle: {self.angle:.1f}°, Position: x={self.x_pos:.2f} m, y={self.y_pos:.2f} m")
+                        self.found_tag = True
+
                     qimg = QtGui.QImage(rgb.data, rgb.shape[1], rgb.shape[0],
                                         rgb.shape[1] * 3, QtGui.QImage.Format.Format_RGB888)
                     qimg = qimg.scaled(CAM_WIDTH * 2, CAM_HEIGHT * 2,
@@ -110,8 +145,7 @@ class ImageProcessor(QtCore.QThread):
                     self.image_processed.emit(qimg)
 
                     if tags:
-                        print(f"[AprilTag] Found {len(tags)} tag(s): {[tag.tag_id for tag in tags]}")
-                        self.tags_detected.emit(tags)  # Emit detected tags
+                        self.tags_detected.emit(tags)
 
                 except Exception as e:
                     print("Processing error:", e)
@@ -148,11 +182,14 @@ class MainWindow(QtWidgets.QWidget):
         # Connect to Crazyflie
         cflib.crtp.init_drivers()
         self.cf = Crazyflie(ro_cache=None, rw_cache='cache')
-        self.cf.connected.add_callback(self.connected)
         self.cf.disconnected.add_callback(self.disconnected)
         
         print('Connecting to %s' % URI)
         self.cf.open_link(URI)
+
+        while not self.cf.is_connected():
+            time.sleep(0.1)
+        self.connected(URI)
 
         if not hasattr(self.cf.link, 'cpx'):
             print('Not connecting with WiFi')
@@ -177,10 +214,33 @@ class MainWindow(QtWidgets.QWidget):
 
     def connected(self, uri):
         print('Connected to {}'.format(uri))
+        self.mc = MotionCommander(self.cf, default_height=0.5)
+        self.start_search()
 
     def closeEvent(self, event):
         self.processor.stop()
         event.accept()
+
+
+    def start_search(self):
+        def _search():
+            increment = 0.2
+            radius = 0.2
+
+            with self.mc:
+                while(1):
+                    for i in range(0, 360, 10):
+                        if self.processor.found_tag:
+                            self.mc.stop()
+                            return
+
+                        self.mc.circle_left(radius_m=radius, velocity=0.2, angle_degrees=i)
+
+                    self.mc.right(increment)
+                    radius += increment
+
+        threading.Thread(target=_search, daemon=True).start()
+
 
 
 # Crazyflie URI and camera settings
