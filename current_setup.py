@@ -135,7 +135,7 @@ class ImageProcessor(QtCore.QThread):
                         self.y_pos = self.distance * np.cos(angle_rad)
                         self.angle = np.degrees(angle_rad)
 
-                        print(f"Distance: {self.distance:.2f}m, Angle: {self.angle:.1f}°, Position: x={self.x_pos:.2f} m, y={self.y_pos:.2f} m")
+                        # print(f"Distance: {self.distance:.2f}m, Angle: {self.angle:.1f}°, Position: x={self.x_pos:.2f} m, y={self.y_pos:.2f} m")
                         self.found_tag = True
 
                     qimg = QtGui.QImage(rgb.data, rgb.shape[1], rgb.shape[0],
@@ -215,33 +215,52 @@ class MainWindow(QtWidgets.QWidget):
     def connected(self, uri):
         print('Connected to {}'.format(uri))
         self.mc = MotionCommander(self.cf, default_height=0.5)
+        # self.light_check()
         self.start_search()
 
     def closeEvent(self, event):
         self.processor.stop()
         event.accept()
 
+    def activate_led_bit_mask(self):
+        self.cf.param.set_value('led.bitmask', 255)
+
+    def deactivate_led_bit_mask(self):
+        self.cf.param.set_value('led.bitmask', 0)
+
+    def light_check(self):
+        self.activate_led_bit_mask()
+        time.sleep(2)
+        self.deactivate_led_bit_mask()
+
+
 
     def start_search(self):
         def _search():
-            increment = 0.2
-            radius = 0.2
-
             with self.mc:
-                while(1):
-                    for i in range(0, 360, 10):
-                        if self.processor.found_tag:
-                            self.mc.stop()
-                            return
+                distance = 0.25
+                inc = 0.25
+                step = 0.05
 
-                        self.mc.circle_left(radius_m=radius, velocity=0.2, angle_degrees=i)
+                while True:
+                    # Loop twice before incrementing the distance
+                    for _ in range(2):
+                        steps = int(distance / step)
+                        # Move forward
+                        for _ in range(steps):
+                            if self.processor.found_tag:
+                                self.mc.stop()
+                                self.light_check()
+                                return
+                            self.mc.left(step)
+                        # Turn 90 left
+                        time.sleep(0.5)
+                        self.mc.turn_left(90)
+                    distance += inc
 
-                    self.mc.right(increment)
-                    radius += increment
+
 
         threading.Thread(target=_search, daemon=True).start()
-
-
 
 # Crazyflie URI and camera settings
 URI = uri_helper.uri_from_env(default='tcp://192.168.4.1:5000')
